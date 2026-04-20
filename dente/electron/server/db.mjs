@@ -60,10 +60,51 @@ export function createDb() {
       FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE CASCADE
     );
 
-    CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(appointment_date);
-    CREATE INDEX IF NOT EXISTS idx_appointments_patient ON appointments(patient_id);
-  `)
+    CREATE TABLE IF NOT EXISTS medical_history (
+      patient_id INTEGER PRIMARY KEY,
+      blood_group TEXT,
+      allergies TEXT,
+      existing_conditions TEXT,
+      current_medications TEXT,
+      previous_dental_history TEXT,
+      emergency_contact_name TEXT,
+      emergency_contact_phone TEXT,
+      emergency_contact_relation TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE CASCADE
+    );
 
+    CREATE TABLE IF NOT EXISTS treatment_plans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      patient_id INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS treatment_steps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id INTEGER NOT NULL,
+      step_number INTEGER NOT NULL,
+      procedure_name TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      scheduled_date TEXT,
+      completed_date TEXT,
+      cost_estimate REAL,
+      notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(plan_id) REFERENCES treatment_plans(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_treatment_plans_patient ON treatment_plans(patient_id);
+    CREATE INDEX IF NOT EXISTS idx_treatment_steps_plan ON treatment_steps(plan_id);
+    `);
   return db
 }
 
@@ -118,7 +159,8 @@ export const patientsRepo = {
            email = @email,
            updated_at = datetime('now')
        WHERE id = @id`,
-    ).run({
+    )
+    d.run({
       id,
       full_name: payload.full_name,
       dob: payload.dob,
@@ -187,7 +229,8 @@ export const proceduresRepo = {
            balance = @balance,
            updated_at = datetime('now')
        WHERE id = @id`,
-    ).run({
+    )
+    d.run({
       id,
       procedure_name: payload.procedure_name,
       procedure_date: payload.procedure_date,
@@ -266,7 +309,8 @@ export const appointmentsRepo = {
            status = @status,
            updated_at = datetime('now')
        WHERE id = @id`,
-    ).run({
+    )
+    d.run({
       id,
       patient_id: payload.patient_id,
       appointment_date: payload.appointment_date,
