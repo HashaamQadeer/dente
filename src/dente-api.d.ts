@@ -139,6 +139,14 @@ export type TreatmentStepCreateUpdate = {
 
 export type TreatmentPlanWithSteps = TreatmentPlan & { steps: TreatmentStep[] }
 
+export type RecycleBinItem = {
+  id: number
+  source_table: string
+  entity_id: string
+  deleted_at: string
+  restored_at: string | null
+}
+
 declare global {
   interface Window {
     dente: {
@@ -173,6 +181,18 @@ declare global {
       addTreatmentStep: (planId: number, data: TreatmentStepCreateUpdate) => Promise<TreatmentStep>
       updateTreatmentStep: (stepId: number, data: TreatmentStepCreateUpdate) => Promise<TreatmentStep>
       deleteTreatmentStep: (stepId: number) => Promise<{ deleted: boolean }>
+      db: {
+        getInfo: () => Promise<{ dbPath: string; backupsDir: string; exists: boolean }>
+        createBackup: (reason?: string) => Promise<{ backupPath: string | null }>
+        exportSnapshot: () => Promise<{ outPath: string }>
+        listRecycleBin: (limit?: number) => Promise<RecycleBinItem[]>
+        restoreRecycleBinItem: (recycleItemId: number) => Promise<{
+          restored: boolean
+          reason?: 'not_found' | 'already_restored' | 'invalid_payload'
+          source_table?: string
+          entity_id?: string
+        }>
+      }
     }
   }
 }
