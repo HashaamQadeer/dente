@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-electron/
+win-unpacked/
+*.log
+builder-debug.yml
+.env
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
