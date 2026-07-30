@@ -5,6 +5,7 @@ import { useForm } from 'react-hook-form'
 
 import type { Patient, Procedure, ProcedureCreateUpdate } from '../dente-api'
 import { getDenteApi } from '../lib/api'
+import { useAuth } from '../lib/useAuth'
 import { Button, Card, Input, Modal, Select } from '../ui/components'
 
 const procedureSchema = z.object({
@@ -24,6 +25,7 @@ function computeBalance(cost: number, paid: number) {
 }
 
 export function ProceduresPage() {
+  const { canDelete, promptDeleteDenied } = useAuth()
   const [patients, setPatients] = useState<Patient[]>([])
   const [patientQuery, setPatientQuery] = useState('')
   const [patientId, setPatientId] = useState<number | null>(null)
@@ -148,6 +150,10 @@ export function ProceduresPage() {
   }
 
   async function onDelete(row: Procedure) {
+    if (!canDelete) {
+      promptDeleteDenied()
+      return
+    }
     const ok = confirm(`Delete procedure "${row.procedure_name}"? This cannot be undone.`)
     if (!ok) return
     try {
@@ -355,9 +361,11 @@ export function ProceduresPage() {
                           <Button variant="secondary" size="sm" onClick={() => setEditing(r)}>
                             Edit
                           </Button>
-                          <Button variant="danger" size="sm" onClick={() => onDelete(r)}>
-                            Delete
-                          </Button>
+                          {canDelete ? (
+                            <Button variant="danger" size="sm" onClick={() => onDelete(r)}>
+                              Delete
+                            </Button>
+                          ) : null}
                         </div>
                       </td>
                     </tr>

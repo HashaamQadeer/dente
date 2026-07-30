@@ -85,6 +85,43 @@ export type FinancialSummary = {
   totalPaid: number
   totalUnpaid: number
   procedureCount: number
+  totalExpenses: number
+  netProfit: number
+}
+
+export type ExpenseCategory =
+  | 'equipment'
+  | 'utilities'
+  | 'rent'
+  | 'salaries'
+  | 'supplies'
+  | 'miscellaneous'
+
+export type Expense = {
+  id: number
+  expense_date: string
+  category: ExpenseCategory
+  description: string
+  amount: number
+  created_at: string
+  updated_at: string
+}
+
+export type ExpenseCreateUpdate = {
+  expense_date: string
+  category: ExpenseCategory
+  description: string
+  amount: number
+}
+
+export type ExpenseCategoryTotal = {
+  category: ExpenseCategory
+  total: number
+}
+
+export type ExpenseMonthlyTotal = {
+  month: string
+  total: number
 }
 
 export type UnpaidBalanceRow = {
@@ -139,17 +176,29 @@ export type TreatmentStepCreateUpdate = {
 
 export type TreatmentPlanWithSteps = TreatmentPlan & { steps: TreatmentStep[] }
 
-export type RecycleBinItem = {
+export type UserRole = 'admin' | 'manager'
+
+export type AuthUser = {
   id: number
-  source_table: string
-  entity_id: string
-  deleted_at: string
-  restored_at: string | null
+  username: string
+  role: UserRole
+}
+
+export type UserAccount = AuthUser & {
+  created_at: string
+  updated_at: string
 }
 
 declare global {
   interface Window {
     dente: {
+      auth: {
+        login: (username: string, password: string) => Promise<AuthUser>
+        logout: () => Promise<null>
+        getSession: () => Promise<AuthUser | null>
+        listUsers: () => Promise<UserAccount[]>
+        changePassword: (userId: number, newPassword: string) => Promise<UserAccount>
+      }
       patients: {
         list: () => Promise<Patient[]>
         searchByName: (query: string) => Promise<Patient[]>
@@ -173,6 +222,15 @@ declare global {
       getMedicalHistory: (patientId: number) => Promise<MedicalHistory | null>
       getFinancialSummary: (period: FinancialPeriod) => Promise<FinancialSummary>
       getUnpaidBalances: () => Promise<UnpaidBalanceRow[]>
+      expenses: {
+        listBetween: (fromDate: string, toDate: string) => Promise<Expense[]>
+        listByMonth: (yearMonth: string) => Promise<Expense[]>
+        categoryBreakdown: (fromDate: string, toDate: string) => Promise<ExpenseCategoryTotal[]>
+        monthlyTotals: (year: number) => Promise<ExpenseMonthlyTotal[]>
+        create: (payload: ExpenseCreateUpdate) => Promise<Expense>
+        update: (id: number, payload: ExpenseCreateUpdate) => Promise<Expense>
+        delete: (id: number) => Promise<{ deleted: boolean }>
+      }
       createTreatmentPlan: (patientId: number, data: TreatmentPlanCreateUpdate) => Promise<TreatmentPlan>
       getTreatmentPlans: (patientId: number) => Promise<TreatmentPlan[]>
       getTreatmentPlanById: (planId: number) => Promise<TreatmentPlanWithSteps>
@@ -181,18 +239,6 @@ declare global {
       addTreatmentStep: (planId: number, data: TreatmentStepCreateUpdate) => Promise<TreatmentStep>
       updateTreatmentStep: (stepId: number, data: TreatmentStepCreateUpdate) => Promise<TreatmentStep>
       deleteTreatmentStep: (stepId: number) => Promise<{ deleted: boolean }>
-      db: {
-        getInfo: () => Promise<{ dbPath: string; backupsDir: string; exists: boolean }>
-        createBackup: (reason?: string) => Promise<{ backupPath: string | null }>
-        exportSnapshot: () => Promise<{ outPath: string }>
-        listRecycleBin: (limit?: number) => Promise<RecycleBinItem[]>
-        restoreRecycleBinItem: (recycleItemId: number) => Promise<{
-          restored: boolean
-          reason?: 'not_found' | 'already_restored' | 'invalid_payload'
-          source_table?: string
-          entity_id?: string
-        }>
-      }
     }
   }
 }

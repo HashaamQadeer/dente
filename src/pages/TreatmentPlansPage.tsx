@@ -14,6 +14,7 @@ import type {
   TreatmentStepStatus,
 } from '../dente-api'
 import { getDenteApi } from '../lib/api'
+import { useAuth } from '../lib/useAuth'
 import { Button, Card, Input, Modal, Select, Textarea } from '../ui/components'
 
 function isoDate(d: Date) {
@@ -87,6 +88,7 @@ function planProgress(steps: TreatmentStep[]) {
 }
 
 export function TreatmentPlansPage() {
+  const { canDelete, promptDeleteDenied } = useAuth()
   const [patients, setPatients] = useState<Patient[]>([])
   const [patientQuery, setPatientQuery] = useState('')
   const [patientId, setPatientId] = useState<number | null>(null)
@@ -298,6 +300,10 @@ export function TreatmentPlansPage() {
   }
 
   async function deletePlan(planId: number) {
+    if (!canDelete) {
+      promptDeleteDenied()
+      return
+    }
     const ok = confirm('Delete this treatment plan? This cannot be undone.')
     if (!ok) return
     try {
@@ -367,6 +373,10 @@ export function TreatmentPlansPage() {
   }
 
   async function deleteStep(planId: number, stepId: number) {
+    if (!canDelete) {
+      promptDeleteDenied()
+      return
+    }
     const ok = confirm('Delete this step?')
     if (!ok) return
     try {
@@ -548,9 +558,11 @@ export function TreatmentPlansPage() {
                       <Button variant="ghost" size="sm" onClick={() => openEditPlan(p)} title="Edit plan">
                         ✎
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => deletePlan(p.id)} title="Delete plan">
-                        🗑
-                      </Button>
+                      {canDelete ? (
+                        <Button variant="ghost" size="sm" onClick={() => deletePlan(p.id)} title="Delete plan">
+                          🗑
+                        </Button>
+                      ) : null}
                       <Button variant="secondary" size="sm" onClick={() => toggleExpand(p.id)} title="Expand/collapse">
                         <span className={isOpen ? 'rotate-180 inline-block transition-transform' : 'inline-block transition-transform'}>
                           ▾
@@ -649,9 +661,11 @@ export function TreatmentPlansPage() {
                                             ✓
                                           </Button>
                                         ) : null}
-                                        <Button variant="ghost" size="sm" title="Delete step" onClick={() => deleteStep(p.id, s.id)}>
-                                          🗑
-                                        </Button>
+                                        {canDelete ? (
+                                          <Button variant="ghost" size="sm" title="Delete step" onClick={() => deleteStep(p.id, s.id)}>
+                                            🗑
+                                          </Button>
+                                        ) : null}
                                       </div>
                                     </div>
 

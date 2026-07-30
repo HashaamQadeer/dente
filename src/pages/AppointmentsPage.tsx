@@ -5,6 +5,7 @@ import { useForm } from 'react-hook-form'
 
 import type { AppointmentCreateUpdate, AppointmentStatus, AppointmentWithPatient, Patient } from '../dente-api'
 import { getDenteApi } from '../lib/api'
+import { useAuth } from '../lib/useAuth'
 import { Button, Card, Input, Modal, Select, Textarea } from '../ui/components'
 
 function isoDate(d: Date) {
@@ -48,6 +49,7 @@ function statusBadge(status: AppointmentStatus) {
 }
 
 export function AppointmentsPage() {
+  const { canDelete, promptDeleteDenied } = useAuth()
   const [rows, setRows] = useState<AppointmentWithPatient[]>([])
   const [patients, setPatients] = useState<Patient[]>([])
   const [loading, setLoading] = useState(false)
@@ -192,6 +194,10 @@ export function AppointmentsPage() {
   }
 
   async function onDelete(row: AppointmentWithPatient) {
+    if (!canDelete) {
+      promptDeleteDenied()
+      return
+    }
     const ok = confirm(`Delete appointment #${row.id} (${row.patient_name})?`)
     if (!ok) return
     try {
@@ -356,9 +362,11 @@ export function AppointmentsPage() {
                       <Button variant="secondary" size="sm" onClick={() => openEdit(r)}>
                         Edit
                       </Button>
-                      <Button variant="danger" size="sm" onClick={() => onDelete(r)}>
-                        Delete
-                      </Button>
+                      {canDelete ? (
+                        <Button variant="danger" size="sm" onClick={() => onDelete(r)}>
+                          Delete
+                        </Button>
+                      ) : null}
                     </div>
                   </td>
                 </tr>

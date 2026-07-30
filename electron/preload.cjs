@@ -1,6 +1,14 @@
-import { contextBridge, ipcRenderer } from 'electron'
+const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('dente', {
+  auth: {
+    login: (username, password) => ipcRenderer.invoke('auth:login', username, password),
+    logout: () => ipcRenderer.invoke('auth:logout'),
+    getSession: () => ipcRenderer.invoke('auth:getSession'),
+    listUsers: () => ipcRenderer.invoke('auth:listUsers'),
+    changePassword: (userId, newPassword) =>
+      ipcRenderer.invoke('auth:changePassword', userId, newPassword),
+  },
   patients: {
     list: () => ipcRenderer.invoke('patients:list'),
     searchByName: (query) => ipcRenderer.invoke('patients:search', query ?? ''),
@@ -20,11 +28,23 @@ contextBridge.exposeInMainWorld('dente', {
     update: (id, payload) => ipcRenderer.invoke('appointments:update', id, payload),
     delete: (id) => ipcRenderer.invoke('appointments:delete', id),
   },
-  upsertMedicalHistory: (patientId, data) => ipcRenderer.invoke('medicalHistory:upsert', patientId, data),
+  upsertMedicalHistory: (patientId, data) =>
+    ipcRenderer.invoke('medicalHistory:upsert', patientId, data),
   getMedicalHistory: (patientId) => ipcRenderer.invoke('medicalHistory:get', patientId),
   getFinancialSummary: (period) => ipcRenderer.invoke('finance:summary', period),
-  getUnpaidBalances: () => ipcRenderer.invoke('finance:unpaid'),
-  createTreatmentPlan: (patientId, data) => ipcRenderer.invoke('treatmentPlans:create', patientId, data),
+  getUnpaidBalances: () => ipcRenderer.invoke('finance:unpaidBalances'),
+  expenses: {
+    listBetween: (fromDate, toDate) => ipcRenderer.invoke('expenses:listBetween', fromDate, toDate),
+    listByMonth: (yearMonth) => ipcRenderer.invoke('expenses:listByMonth', yearMonth),
+    categoryBreakdown: (fromDate, toDate) =>
+      ipcRenderer.invoke('expenses:categoryBreakdown', fromDate, toDate),
+    monthlyTotals: (year) => ipcRenderer.invoke('expenses:monthlyTotals', year),
+    create: (payload) => ipcRenderer.invoke('expenses:create', payload),
+    update: (id, payload) => ipcRenderer.invoke('expenses:update', id, payload),
+    delete: (id) => ipcRenderer.invoke('expenses:delete', id),
+  },
+  createTreatmentPlan: (patientId, data) =>
+    ipcRenderer.invoke('treatmentPlans:create', patientId, data),
   getTreatmentPlans: (patientId) => ipcRenderer.invoke('treatmentPlans:listByPatient', patientId),
   getTreatmentPlanById: (planId) => ipcRenderer.invoke('treatmentPlans:getById', planId),
   updateTreatmentPlan: (planId, data) => ipcRenderer.invoke('treatmentPlans:update', planId, data),
@@ -32,12 +52,4 @@ contextBridge.exposeInMainWorld('dente', {
   addTreatmentStep: (planId, data) => ipcRenderer.invoke('treatmentSteps:add', planId, data),
   updateTreatmentStep: (stepId, data) => ipcRenderer.invoke('treatmentSteps:update', stepId, data),
   deleteTreatmentStep: (stepId) => ipcRenderer.invoke('treatmentSteps:delete', stepId),
-  db: {
-    getInfo: () => ipcRenderer.invoke('db:getInfo'),
-    createBackup: (reason) => ipcRenderer.invoke('db:createBackup', reason),
-    exportSnapshot: () => ipcRenderer.invoke('db:exportSnapshot'),
-    listRecycleBin: (limit) => ipcRenderer.invoke('db:listRecycleBin', limit),
-    restoreRecycleBinItem: (recycleItemId) => ipcRenderer.invoke('db:restoreRecycleBinItem', recycleItemId),
-  },
 })
-

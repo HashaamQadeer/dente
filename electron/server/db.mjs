@@ -1,7 +1,7 @@
 import path from 'node:path'
-import fs from 'node:fs'
 import Database from 'better-sqlite3'
 import { app } from 'electron'
+import { hashPassword } from './auth.mjs'
 
 let db = null
 
@@ -10,70 +10,12 @@ function getDbFilePath() {
   return path.join(userData, 'dente.sqlite')
 }
 
-function getBackupsDirPath() {
-  return path.join(app.getPath('userData'), 'backups')
-}
-
-function nowStamp() {
-  return new Date().toISOString().replace(/[:.]/g, '-')
-}
-
-function safeCopyIfExists(from, to) {
-  if (!fs.existsSync(from)) return
-  fs.copyFileSync(from, to)
-}
-
-function createFileBackup(reason = 'manual') {
-  const dbPath = getDbFilePath()
-  if (!fs.existsSync(dbPath)) return null
-  const backupsDir = getBackupsDirPath()
-  fs.mkdirSync(backupsDir, { recursive: true })
-  const stamp = nowStamp()
-  const baseName = `dente-${reason}-${stamp}`
-  const sqliteBackup = path.join(backupsDir, `${baseName}.sqlite`)
-
-  safeCopyIfExists(dbPath, sqliteBackup)
-  safeCopyIfExists(`${dbPath}-wal`, path.join(backupsDir, `${baseName}.sqlite-wal`))
-  safeCopyIfExists(`${dbPath}-shm`, path.join(backupsDir, `${baseName}.sqlite-shm`))
-  return sqliteBackup
-}
-
-function archiveDeletedRow(d, tableName, entityId, payload) {
-  d.prepare(
-    `INSERT INTO recycle_bin (source_table, entity_id, payload_json)
-     VALUES (@source_table, @entity_id, @payload_json)`,
-  ).run({
-    source_table: tableName,
-    entity_id: String(entityId),
-    payload_json: JSON.stringify(payload),
-  })
-}
-
-function restoreDeletedRow(d, recycleItemId) {
-  const item = d.prepare('SELECT * FROM recycle_bin WHERE id = ?').get(recycleItemId)
-  if (!item) return { restored: false, reason: 'not_found' }
-  if (item.restored_at) return { restored: false, reason: 'already_restored' }
-
-  const tableName = String(item.source_table ?? '').trim()
-  const payload = JSON.parse(item.payload_json)
-  const keys = Object.keys(payload ?? {})
-  if (!tableName || !keys.length) return { restored: false, reason: 'invalid_payload' }
-
-  const columnsSql = keys.map((k) => `"${k}"`).join(', ')
-  const valuesSql = keys.map((k) => `@${k}`).join(', ')
-  d.prepare(`INSERT OR REPLACE INTO "${tableName}" (${columnsSql}) VALUES (${valuesSql})`).run(payload)
-  d.prepare(`UPDATE recycle_bin SET restored_at = datetime('now') WHERE id = ?`).run(recycleItemId)
-  return { restored: true, source_table: tableName, entity_id: item.entity_id }
-}
-
 export function createDb() {
   if (db) return db
 
   db = new Database(getDbFilePath())
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
-  db.pragma('synchronous = FULL')
-  db.pragma('busy_timeout = 5000')
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS patients (
@@ -164,18 +106,42 @@ export function createDb() {
     CREATE INDEX IF NOT EXISTS idx_treatment_plans_patient ON treatment_plans(patient_id);
     CREATE INDEX IF NOT EXISTS idx_treatment_steps_plan ON treatment_steps(plan_id);
 
-    CREATE TABLE IF NOT EXISTS recycle_bin (
+    CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source_table TEXT NOT NULL,
-      entity_id TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      deleted_at TEXT NOT NULL DEFAULT (datetime('now')),
-      restored_at TEXT
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('admin', 'manager')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS expenses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      expense_date TEXT NOT NULL,
+      category TEXT NOT NULL,
+      description TEXT NOT NULL,
+      amount REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);
+    CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
     `);
 
-  createFileBackup('startup')
+  seedDefaultUsers(db)
   return db
+}
+
+function seedDefaultUsers(d) {
+  const count = d.prepare('SELECT COUNT(*) AS n FROM users').get().n
+  if (count > 0) return
+
+  const insert = d.prepare(
+    `INSERT INTO users (username, password_hash, role) VALUES (@username, @password_hash, @role)`,
+  )
+  insert.run({ username: 'admin', password_hash: hashPassword('admin'), role: 'admin' })
+  insert.run({ username: 'manager', password_hash: hashPassword('manager'), role: 'manager' })
 }
 
 function ensureDb() {
@@ -219,7 +185,7 @@ export const patientsRepo = {
   },
   update(id, payload) {
     const d = ensureDb()
-    const stmt = d.prepare(
+    d.prepare(
       `UPDATE patients
        SET full_name = @full_name,
            dob = @dob,
@@ -230,7 +196,7 @@ export const patientsRepo = {
            updated_at = datetime('now')
        WHERE id = @id`,
     )
-    stmt.run({
+    d.run({
       id,
       full_name: payload.full_name,
       dob: payload.dob,
@@ -243,31 +209,8 @@ export const patientsRepo = {
   },
   remove(id) {
     const d = ensureDb()
-    const tx = d.transaction((patientId) => {
-      const patient = d.prepare('SELECT * FROM patients WHERE id = ?').get(patientId)
-      if (!patient) return { deleted: false }
-
-      const procedures = d.prepare('SELECT * FROM procedures WHERE patient_id = ?').all(patientId)
-      const appointments = d.prepare('SELECT * FROM appointments WHERE patient_id = ?').all(patientId)
-      const plans = d.prepare('SELECT * FROM treatment_plans WHERE patient_id = ?').all(patientId)
-      const medicalHistory = d.prepare('SELECT * FROM medical_history WHERE patient_id = ?').get(patientId) ?? null
-
-      for (const row of procedures) archiveDeletedRow(d, 'procedures', row.id, row)
-      for (const row of appointments) archiveDeletedRow(d, 'appointments', row.id, row)
-      for (const row of plans) {
-        const steps = d.prepare('SELECT * FROM treatment_steps WHERE plan_id = ?').all(row.id)
-        for (const step of steps) archiveDeletedRow(d, 'treatment_steps', step.id, step)
-        archiveDeletedRow(d, 'treatment_plans', row.id, row)
-      }
-      if (medicalHistory) archiveDeletedRow(d, 'medical_history', medicalHistory.patient_id, medicalHistory)
-      archiveDeletedRow(d, 'patients', patient.id, patient)
-
-      const info = d.prepare('DELETE FROM patients WHERE id = ?').run(patientId)
-      return { deleted: info.changes > 0 }
-    })
-
-    createFileBackup('before-patient-delete')
-    return tx(id)
+    const info = d.prepare('DELETE FROM patients WHERE id = ?').run(id)
+    return { deleted: info.changes > 0 }
   },
 }
 
@@ -313,7 +256,7 @@ export const proceduresRepo = {
       ? Number(payload.balance)
       : Math.max(0, cost - paid)
 
-    const stmt = d.prepare(
+    d.prepare(
       `UPDATE procedures
        SET procedure_name = @procedure_name,
            procedure_date = @procedure_date,
@@ -323,7 +266,7 @@ export const proceduresRepo = {
            updated_at = datetime('now')
        WHERE id = @id`,
     )
-    stmt.run({
+    d.run({
       id,
       procedure_name: payload.procedure_name,
       procedure_date: payload.procedure_date,
@@ -335,44 +278,12 @@ export const proceduresRepo = {
   },
   remove(id) {
     const d = ensureDb()
-    const row = d.prepare('SELECT * FROM procedures WHERE id = ?').get(id)
-    if (!row) return { deleted: false }
-    archiveDeletedRow(d, 'procedures', row.id, row)
-    createFileBackup('before-procedure-delete')
     const info = d.prepare('DELETE FROM procedures WHERE id = ?').run(id)
     return { deleted: info.changes > 0 }
   },
 }
 
 const allowedAppointmentStatuses = new Set(['scheduled', 'completed', 'cancelled', 'no_show'])
-const allowedFinancialPeriods = new Set(['today', 'week', 'month', 'year'])
-const allowedTreatmentPlanStatuses = new Set(['active', 'completed', 'cancelled'])
-const allowedTreatmentStepStatuses = new Set(['pending', 'in-progress', 'completed'])
-
-function normalizeNullableText(value) {
-  const text = String(value ?? '').trim()
-  return text ? text : null
-}
-
-function toNonNegativeNumber(value) {
-  const n = Number(value)
-  if (!Number.isFinite(n) || n < 0) return 0
-  return n
-}
-
-function getPeriodRange(period) {
-  const p = allowedFinancialPeriods.has(period) ? period : 'month'
-  if (p === 'today') {
-    return { fromExpr: "date('now')", toExpr: "date('now')" }
-  }
-  if (p === 'week') {
-    return { fromExpr: "date('now', 'weekday 0', '-6 days')", toExpr: "date('now', 'weekday 0')" }
-  }
-  if (p === 'year') {
-    return { fromExpr: "date('now', 'start of year')", toExpr: "date('now')" }
-  }
-  return { fromExpr: "date('now', 'start of month')", toExpr: "date('now')" }
-}
 
 export const appointmentsRepo = {
   listBetweenDates(fromDate, toDate) {
@@ -423,7 +334,7 @@ export const appointmentsRepo = {
     const d = ensureDb()
     const status = allowedAppointmentStatuses.has(payload.status) ? payload.status : 'scheduled'
     const endTime = payload.end_time?.trim() ? payload.end_time.trim() : null
-    const stmt = d.prepare(
+    d.prepare(
       `UPDATE appointments
        SET patient_id = @patient_id,
            appointment_date = @appointment_date,
@@ -435,7 +346,7 @@ export const appointmentsRepo = {
            updated_at = datetime('now')
        WHERE id = @id`,
     )
-    stmt.run({
+    d.run({
       id,
       patient_id: payload.patient_id,
       appointment_date: payload.appointment_date,
@@ -449,60 +360,119 @@ export const appointmentsRepo = {
   },
   remove(id) {
     const d = ensureDb()
-    const row = d.prepare('SELECT * FROM appointments WHERE id = ?').get(id)
-    if (!row) return { deleted: false }
-    archiveDeletedRow(d, 'appointments', row.id, row)
-    createFileBackup('before-appointment-delete')
     const info = d.prepare('DELETE FROM appointments WHERE id = ?').run(id)
     return { deleted: info.changes > 0 }
   },
 }
 
+export const usersRepo = {
+  findByUsername(username) {
+    const d = ensureDb()
+    return d.prepare('SELECT * FROM users WHERE username = ?').get(username.trim())
+  },
+  findById(id) {
+    const d = ensureDb()
+    return d.prepare('SELECT * FROM users WHERE id = ?').get(id)
+  },
+  list() {
+    const d = ensureDb()
+    return d
+      .prepare('SELECT id, username, role, created_at, updated_at FROM users ORDER BY username COLLATE NOCASE ASC')
+      .all()
+  },
+  updatePassword(id, passwordHash) {
+    const d = ensureDb()
+    d.prepare(`UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`).run(
+      passwordHash,
+      id,
+    )
+    return d.prepare('SELECT id, username, role, created_at, updated_at FROM users WHERE id = ?').get(id)
+  },
+}
+
 export const medicalHistoryRepo = {
-  getByPatient(patientId) {
+  get(patientId) {
     const d = ensureDb()
     return d.prepare('SELECT * FROM medical_history WHERE patient_id = ?').get(patientId) ?? null
   },
   upsert(patientId, payload) {
     const d = ensureDb()
-    d.prepare(
-      `INSERT INTO medical_history (
-         patient_id, blood_group, allergies, existing_conditions, current_medications,
-         previous_dental_history, emergency_contact_name, emergency_contact_phone, emergency_contact_relation
-       )
-       VALUES (
-         @patient_id, @blood_group, @allergies, @existing_conditions, @current_medications,
-         @previous_dental_history, @emergency_contact_name, @emergency_contact_phone, @emergency_contact_relation
-       )
-       ON CONFLICT(patient_id) DO UPDATE SET
-         blood_group = excluded.blood_group,
-         allergies = excluded.allergies,
-         existing_conditions = excluded.existing_conditions,
-         current_medications = excluded.current_medications,
-         previous_dental_history = excluded.previous_dental_history,
-         emergency_contact_name = excluded.emergency_contact_name,
-         emergency_contact_phone = excluded.emergency_contact_phone,
-         emergency_contact_relation = excluded.emergency_contact_relation,
-         updated_at = datetime('now')`,
-    ).run({
+    const existing = d.prepare('SELECT patient_id FROM medical_history WHERE patient_id = ?').get(patientId)
+    const data = {
       patient_id: patientId,
-      blood_group: normalizeNullableText(payload.blood_group),
-      allergies: normalizeNullableText(payload.allergies),
-      existing_conditions: normalizeNullableText(payload.existing_conditions),
-      current_medications: normalizeNullableText(payload.current_medications),
-      previous_dental_history: normalizeNullableText(payload.previous_dental_history),
-      emergency_contact_name: normalizeNullableText(payload.emergency_contact_name),
-      emergency_contact_phone: normalizeNullableText(payload.emergency_contact_phone),
-      emergency_contact_relation: normalizeNullableText(payload.emergency_contact_relation),
-    })
-    return this.getByPatient(patientId)
+      blood_group: payload.blood_group?.trim() ? payload.blood_group.trim() : null,
+      allergies: payload.allergies?.trim() ? payload.allergies.trim() : null,
+      existing_conditions: payload.existing_conditions?.trim() ? payload.existing_conditions.trim() : null,
+      current_medications: payload.current_medications?.trim() ? payload.current_medications.trim() : null,
+      previous_dental_history: payload.previous_dental_history?.trim()
+        ? payload.previous_dental_history.trim()
+        : null,
+      emergency_contact_name: payload.emergency_contact_name?.trim()
+        ? payload.emergency_contact_name.trim()
+        : null,
+      emergency_contact_phone: payload.emergency_contact_phone?.trim()
+        ? payload.emergency_contact_phone.trim()
+        : null,
+      emergency_contact_relation: payload.emergency_contact_relation?.trim()
+        ? payload.emergency_contact_relation.trim()
+        : null,
+    }
+    if (existing) {
+      d.prepare(
+        `UPDATE medical_history
+         SET blood_group = @blood_group,
+             allergies = @allergies,
+             existing_conditions = @existing_conditions,
+             current_medications = @current_medications,
+             previous_dental_history = @previous_dental_history,
+             emergency_contact_name = @emergency_contact_name,
+             emergency_contact_phone = @emergency_contact_phone,
+             emergency_contact_relation = @emergency_contact_relation,
+             updated_at = datetime('now')
+         WHERE patient_id = @patient_id`,
+      ).run(data)
+    } else {
+      d.prepare(
+        `INSERT INTO medical_history (
+           patient_id, blood_group, allergies, existing_conditions, current_medications,
+           previous_dental_history, emergency_contact_name, emergency_contact_phone, emergency_contact_relation
+         ) VALUES (
+           @patient_id, @blood_group, @allergies, @existing_conditions, @current_medications,
+           @previous_dental_history, @emergency_contact_name, @emergency_contact_phone, @emergency_contact_relation
+         )`,
+      ).run(data)
+    }
+    return d.prepare('SELECT * FROM medical_history WHERE patient_id = ?').get(patientId)
   },
+}
+
+function periodDateRange(period) {
+  const now = new Date()
+  const today = now.toISOString().slice(0, 10)
+  if (period === 'today') return { from: today, to: today }
+  if (period === 'week') {
+    const day = now.getDay()
+    const diff = day === 0 ? 6 : day - 1
+    const monday = new Date(now)
+    monday.setDate(now.getDate() - diff)
+    const sunday = new Date(monday)
+    sunday.setDate(monday.getDate() + 6)
+    return { from: monday.toISOString().slice(0, 10), to: sunday.toISOString().slice(0, 10) }
+  }
+  if (period === 'month') {
+    const from = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
+    const last = new Date(now.getFullYear(), now.getMonth() + 1, 0)
+    return { from, to: last.toISOString().slice(0, 10) }
+  }
+  const from = `${now.getFullYear()}-01-01`
+  const to = `${now.getFullYear()}-12-31`
+  return { from, to }
 }
 
 export const financeRepo = {
   getSummary(period) {
     const d = ensureDb()
-    const { fromExpr, toExpr } = getPeriodRange(period)
+    const { from, to } = periodDateRange(period)
     const row = d
       .prepare(
         `SELECT
@@ -511,14 +481,25 @@ export const financeRepo = {
            COALESCE(SUM(balance), 0) AS totalUnpaid,
            COUNT(*) AS procedureCount
          FROM procedures
-         WHERE date(procedure_date) >= ${fromExpr} AND date(procedure_date) <= ${toExpr}`,
+         WHERE procedure_date >= @from AND procedure_date <= @to`,
       )
-      .get()
+      .get({ from, to })
+    const expenseRow = d
+      .prepare(
+        `SELECT COALESCE(SUM(amount), 0) AS totalExpenses
+         FROM expenses
+         WHERE expense_date >= @from AND expense_date <= @to`,
+      )
+      .get({ from, to })
+    const totalPaid = Number(row.totalPaid) || 0
+    const totalExpenses = Number(expenseRow.totalExpenses) || 0
     return {
-      totalRevenue: Number(row?.totalRevenue ?? 0),
-      totalPaid: Number(row?.totalPaid ?? 0),
-      totalUnpaid: Number(row?.totalUnpaid ?? 0),
-      procedureCount: Number(row?.procedureCount ?? 0),
+      totalRevenue: Number(row.totalRevenue) || 0,
+      totalPaid,
+      totalUnpaid: Number(row.totalUnpaid) || 0,
+      procedureCount: Number(row.procedureCount) || 0,
+      totalExpenses,
+      netProfit: totalPaid - totalExpenses,
     }
   },
   getUnpaidBalances() {
@@ -528,34 +509,178 @@ export const financeRepo = {
         `SELECT
            p.id AS patient_id,
            p.full_name AS patient_name,
-           p.phone AS phone,
+           p.phone,
            COUNT(pr.id) AS procedure_count,
            COALESCE(SUM(pr.balance), 0) AS total_owed
-         FROM procedures pr
-         JOIN patients p ON p.id = pr.patient_id
-         WHERE COALESCE(pr.balance, 0) > 0
-         GROUP BY p.id, p.full_name, p.phone
+         FROM patients p
+         JOIN procedures pr ON pr.patient_id = p.id
+         WHERE pr.balance > 0
+         GROUP BY p.id
          ORDER BY total_owed DESC, p.full_name COLLATE NOCASE ASC`,
       )
       .all()
+      .map((r) => ({
+        ...r,
+        procedure_count: Number(r.procedure_count) || 0,
+        total_owed: Number(r.total_owed) || 0,
+      }))
   },
 }
+
+const allowedExpenseCategories = new Set([
+  'equipment',
+  'utilities',
+  'rent',
+  'salaries',
+  'supplies',
+  'miscellaneous',
+])
+
+function monthDateRange(yearMonth) {
+  const [yearStr, monthStr] = String(yearMonth ?? '').split('-')
+  const year = Number(yearStr)
+  const month = Number(monthStr)
+  if (!year || !month || month < 1 || month > 12) {
+    const now = new Date()
+    const y = now.getFullYear()
+    const m = now.getMonth() + 1
+    const from = `${y}-${String(m).padStart(2, '0')}-01`
+    const last = new Date(y, m, 0)
+    return { from, to: last.toISOString().slice(0, 10) }
+  }
+  const from = `${year}-${String(month).padStart(2, '0')}-01`
+  const last = new Date(year, month, 0)
+  return { from, to: last.toISOString().slice(0, 10) }
+}
+
+export const expensesRepo = {
+  listBetween(fromDate, toDate) {
+    const d = ensureDb()
+    const from = (fromDate ?? '').trim()
+    const to = (toDate ?? '').trim()
+    if (!from || !to) {
+      return d
+        .prepare(
+          `SELECT * FROM expenses ORDER BY expense_date DESC, id DESC`,
+        )
+        .all()
+    }
+    return d
+      .prepare(
+        `SELECT * FROM expenses
+         WHERE expense_date >= @from AND expense_date <= @to
+         ORDER BY expense_date DESC, id DESC`,
+      )
+      .all({ from, to })
+  },
+  listByMonth(yearMonth) {
+    const { from, to } = monthDateRange(yearMonth)
+    return this.listBetween(from, to)
+  },
+  getCategoryBreakdown(fromDate, toDate) {
+    const d = ensureDb()
+    const from = (fromDate ?? '').trim()
+    const to = (toDate ?? '').trim()
+    return d
+      .prepare(
+        `SELECT category, COALESCE(SUM(amount), 0) AS total
+         FROM expenses
+         WHERE expense_date >= @from AND expense_date <= @to
+         GROUP BY category
+         ORDER BY total DESC`,
+      )
+      .all({ from, to })
+      .map((r) => ({ category: r.category, total: Number(r.total) || 0 }))
+  },
+  getMonthlyTotals(year) {
+    const d = ensureDb()
+    const y = Number(year) || new Date().getFullYear()
+    const from = `${y}-01-01`
+    const to = `${y}-12-31`
+    const rows = d
+      .prepare(
+        `SELECT substr(expense_date, 1, 7) AS month, COALESCE(SUM(amount), 0) AS total
+         FROM expenses
+         WHERE expense_date >= @from AND expense_date <= @to
+         GROUP BY substr(expense_date, 1, 7)
+         ORDER BY month ASC`,
+      )
+      .all({ from, to })
+    return rows.map((r) => ({ month: r.month, total: Number(r.total) || 0 }))
+  },
+  create(payload) {
+    const d = ensureDb()
+    const category = allowedExpenseCategories.has(payload.category)
+      ? payload.category
+      : 'miscellaneous'
+    const info = d
+      .prepare(
+        `INSERT INTO expenses (expense_date, category, description, amount)
+         VALUES (@expense_date, @category, @description, @amount)`,
+      )
+      .run({
+        expense_date: payload.expense_date,
+        category,
+        description: payload.description.trim(),
+        amount: Number(payload.amount ?? 0) || 0,
+      })
+    return d.prepare('SELECT * FROM expenses WHERE id = ?').get(info.lastInsertRowid)
+  },
+  update(id, payload) {
+    const d = ensureDb()
+    const category = allowedExpenseCategories.has(payload.category)
+      ? payload.category
+      : 'miscellaneous'
+    d.prepare(
+      `UPDATE expenses
+       SET expense_date = @expense_date,
+           category = @category,
+           description = @description,
+           amount = @amount,
+           updated_at = datetime('now')
+       WHERE id = @id`,
+    ).run({
+      id,
+      expense_date: payload.expense_date,
+      category,
+      description: payload.description.trim(),
+      amount: Number(payload.amount ?? 0) || 0,
+    })
+    return d.prepare('SELECT * FROM expenses WHERE id = ?').get(id)
+  },
+  remove(id) {
+    const d = ensureDb()
+    const info = d.prepare('DELETE FROM expenses WHERE id = ?').run(id)
+    return { deleted: info.changes > 0 }
+  },
+}
+
+const allowedPlanStatuses = new Set(['active', 'completed', 'cancelled'])
+const allowedStepStatuses = new Set(['pending', 'in-progress', 'completed'])
 
 export const treatmentPlansRepo = {
   listByPatient(patientId) {
     const d = ensureDb()
     return d
       .prepare(
-        `SELECT id, patient_id, title, description, status, created_at
-         FROM treatment_plans
-         WHERE patient_id = ?
-         ORDER BY datetime(created_at) DESC, id DESC`,
+        `SELECT * FROM treatment_plans WHERE patient_id = ? ORDER BY created_at DESC, id DESC`,
       )
       .all(patientId)
   },
+  getById(planId) {
+    const d = ensureDb()
+    const plan = d.prepare('SELECT * FROM treatment_plans WHERE id = ?').get(planId)
+    if (!plan) return null
+    const steps = d
+      .prepare(
+        `SELECT * FROM treatment_steps WHERE plan_id = ? ORDER BY step_number ASC, id ASC`,
+      )
+      .all(planId)
+    return { ...plan, steps }
+  },
   create(patientId, payload) {
     const d = ensureDb()
-    const status = allowedTreatmentPlanStatuses.has(payload.status) ? payload.status : 'active'
+    const status = allowedPlanStatuses.has(payload.status) ? payload.status : 'active'
     const info = d
       .prepare(
         `INSERT INTO treatment_plans (patient_id, title, description, status)
@@ -563,35 +688,15 @@ export const treatmentPlansRepo = {
       )
       .run({
         patient_id: patientId,
-        title: String(payload.title ?? '').trim(),
-        description: normalizeNullableText(payload.description),
+        title: payload.title,
+        description: payload.description?.trim() ? payload.description.trim() : null,
         status,
       })
-    return d
-      .prepare('SELECT id, patient_id, title, description, status, created_at FROM treatment_plans WHERE id = ?')
-      .get(info.lastInsertRowid)
-  },
-  getById(planId) {
-    const d = ensureDb()
-    const plan = d
-      .prepare('SELECT id, patient_id, title, description, status, created_at FROM treatment_plans WHERE id = ?')
-      .get(planId)
-    if (!plan) return null
-    const steps = d
-      .prepare(
-        `SELECT
-           id, plan_id, step_number, procedure_name, description, status,
-           scheduled_date, completed_date, cost_estimate, notes
-         FROM treatment_steps
-         WHERE plan_id = ?
-         ORDER BY step_number ASC, id ASC`,
-      )
-      .all(planId)
-    return { ...plan, steps }
+    return d.prepare('SELECT * FROM treatment_plans WHERE id = ?').get(info.lastInsertRowid)
   },
   update(planId, payload) {
     const d = ensureDb()
-    const status = allowedTreatmentPlanStatuses.has(payload.status) ? payload.status : 'active'
+    const status = allowedPlanStatuses.has(payload.status) ? payload.status : 'active'
     d.prepare(
       `UPDATE treatment_plans
        SET title = @title,
@@ -601,86 +706,56 @@ export const treatmentPlansRepo = {
        WHERE id = @id`,
     ).run({
       id: planId,
-      title: String(payload.title ?? '').trim(),
-      description: normalizeNullableText(payload.description),
+      title: payload.title,
+      description: payload.description?.trim() ? payload.description.trim() : null,
       status,
     })
-    return d
-      .prepare('SELECT id, patient_id, title, description, status, created_at FROM treatment_plans WHERE id = ?')
-      .get(planId)
+    return d.prepare('SELECT * FROM treatment_plans WHERE id = ?').get(planId)
   },
   remove(planId) {
     const d = ensureDb()
-    const tx = d.transaction((targetPlanId) => {
-      const row = d.prepare('SELECT * FROM treatment_plans WHERE id = ?').get(targetPlanId)
-      if (!row) return { deleted: false }
-      const steps = d.prepare('SELECT * FROM treatment_steps WHERE plan_id = ?').all(targetPlanId)
-      for (const step of steps) archiveDeletedRow(d, 'treatment_steps', step.id, step)
-      archiveDeletedRow(d, 'treatment_plans', row.id, row)
-      const info = d.prepare('DELETE FROM treatment_plans WHERE id = ?').run(targetPlanId)
-      return { deleted: info.changes > 0 }
-    })
-    createFileBackup('before-plan-delete')
-    return tx(planId)
+    const info = d.prepare('DELETE FROM treatment_plans WHERE id = ?').run(planId)
+    return { deleted: info.changes > 0 }
   },
   addStep(planId, payload) {
     const d = ensureDb()
-    const tx = d.transaction((planIdArg, payloadArg) => {
-      const row = d
-        .prepare('SELECT COALESCE(MAX(step_number), 0) AS max_step FROM treatment_steps WHERE plan_id = ?')
-        .get(planIdArg)
-      const fallback = Number(row?.max_step ?? 0) + 1
-      const stepNumber = Number.isInteger(payloadArg.step_number) && payloadArg.step_number > 0
-        ? payloadArg.step_number
-        : fallback
-      const status = allowedTreatmentStepStatuses.has(payloadArg.status) ? payloadArg.status : 'pending'
-      const info = d
-        .prepare(
-          `INSERT INTO treatment_steps (
-             plan_id, step_number, procedure_name, description, status,
-             scheduled_date, completed_date, cost_estimate, notes
-           )
-           VALUES (
-             @plan_id, @step_number, @procedure_name, @description, @status,
-             @scheduled_date, @completed_date, @cost_estimate, @notes
-           )`,
-        )
-        .run({
-          plan_id: planIdArg,
-          step_number: stepNumber,
-          procedure_name: String(payloadArg.procedure_name ?? '').trim(),
-          description: normalizeNullableText(payloadArg.description),
-          status,
-          scheduled_date: normalizeNullableText(payloadArg.scheduled_date),
-          completed_date: normalizeNullableText(payloadArg.completed_date),
-          cost_estimate:
-            payloadArg.cost_estimate == null ? null : toNonNegativeNumber(payloadArg.cost_estimate),
-          notes: normalizeNullableText(payloadArg.notes),
-        })
-      return d
-        .prepare(
-          `SELECT
-             id, plan_id, step_number, procedure_name, description, status,
-             scheduled_date, completed_date, cost_estimate, notes
-           FROM treatment_steps
-           WHERE id = ?`,
-        )
-        .get(info.lastInsertRowid)
-    })
-    return tx(planId, payload)
+    const status = allowedStepStatuses.has(payload.status) ? payload.status : 'pending'
+    const maxStep = d
+      .prepare('SELECT COALESCE(MAX(step_number), 0) AS n FROM treatment_steps WHERE plan_id = ?')
+      .get(planId).n
+    const stepNumber = payload.step_number ?? maxStep + 1
+    const info = d
+      .prepare(
+        `INSERT INTO treatment_steps (
+           plan_id, step_number, procedure_name, description, status,
+           scheduled_date, completed_date, cost_estimate, notes
+         ) VALUES (
+           @plan_id, @step_number, @procedure_name, @description, @status,
+           @scheduled_date, @completed_date, @cost_estimate, @notes
+         )`,
+      )
+      .run({
+        plan_id: planId,
+        step_number: stepNumber,
+        procedure_name: payload.procedure_name,
+        description: payload.description?.trim() ? payload.description.trim() : null,
+        status,
+        scheduled_date: payload.scheduled_date?.trim() ? payload.scheduled_date.trim() : null,
+        completed_date: payload.completed_date?.trim() ? payload.completed_date.trim() : null,
+        cost_estimate:
+          payload.cost_estimate == null || payload.cost_estimate === ''
+            ? null
+            : Number(payload.cost_estimate),
+        notes: payload.notes?.trim() ? payload.notes.trim() : null,
+      })
+    return d.prepare('SELECT * FROM treatment_steps WHERE id = ?').get(info.lastInsertRowid)
   },
   updateStep(stepId, payload) {
     const d = ensureDb()
-    const existing = d.prepare('SELECT * FROM treatment_steps WHERE id = ?').get(stepId)
-    if (!existing) return null
-    const status = allowedTreatmentStepStatuses.has(payload.status) ? payload.status : existing.status
-    const stepNumber =
-      Number.isInteger(payload.step_number) && payload.step_number > 0
-        ? payload.step_number
-        : existing.step_number
+    const status = allowedStepStatuses.has(payload.status) ? payload.status : 'pending'
     d.prepare(
       `UPDATE treatment_steps
-       SET step_number = @step_number,
+       SET step_number = COALESCE(@step_number, step_number),
            procedure_name = @procedure_name,
            description = @description,
            status = @status,
@@ -692,85 +767,24 @@ export const treatmentPlansRepo = {
        WHERE id = @id`,
     ).run({
       id: stepId,
-      step_number: stepNumber,
-      procedure_name: String(payload.procedure_name ?? existing.procedure_name).trim(),
-      description: normalizeNullableText(payload.description),
+      step_number: payload.step_number ?? null,
+      procedure_name: payload.procedure_name,
+      description: payload.description?.trim() ? payload.description.trim() : null,
       status,
-      scheduled_date: normalizeNullableText(payload.scheduled_date),
-      completed_date: normalizeNullableText(payload.completed_date),
-      cost_estimate: payload.cost_estimate == null ? null : toNonNegativeNumber(payload.cost_estimate),
-      notes: normalizeNullableText(payload.notes),
+      scheduled_date: payload.scheduled_date?.trim() ? payload.scheduled_date.trim() : null,
+      completed_date: payload.completed_date?.trim() ? payload.completed_date.trim() : null,
+      cost_estimate:
+        payload.cost_estimate == null || payload.cost_estimate === ''
+          ? null
+          : Number(payload.cost_estimate),
+      notes: payload.notes?.trim() ? payload.notes.trim() : null,
     })
-    return d
-      .prepare(
-        `SELECT
-           id, plan_id, step_number, procedure_name, description, status,
-           scheduled_date, completed_date, cost_estimate, notes
-         FROM treatment_steps
-         WHERE id = ?`,
-      )
-      .get(stepId)
+    return d.prepare('SELECT * FROM treatment_steps WHERE id = ?').get(stepId)
   },
   removeStep(stepId) {
     const d = ensureDb()
-    const row = d.prepare('SELECT * FROM treatment_steps WHERE id = ?').get(stepId)
-    if (!row) return { deleted: false }
-    archiveDeletedRow(d, 'treatment_steps', row.id, row)
-    createFileBackup('before-step-delete')
     const info = d.prepare('DELETE FROM treatment_steps WHERE id = ?').run(stepId)
     return { deleted: info.changes > 0 }
-  },
-}
-
-export const maintenanceRepo = {
-  getDbInfo() {
-    const dbPath = getDbFilePath()
-    return {
-      dbPath,
-      backupsDir: getBackupsDirPath(),
-      exists: fs.existsSync(dbPath),
-    }
-  },
-  createBackup(reason = 'manual') {
-    const backupPath = createFileBackup(reason)
-    return { backupPath }
-  },
-  exportSnapshot() {
-    const d = ensureDb()
-    const payload = {
-      exported_at: new Date().toISOString(),
-      patients: d.prepare('SELECT * FROM patients ORDER BY id ASC').all(),
-      procedures: d.prepare('SELECT * FROM procedures ORDER BY id ASC').all(),
-      appointments: d.prepare('SELECT * FROM appointments ORDER BY id ASC').all(),
-      medical_history: d.prepare('SELECT * FROM medical_history ORDER BY patient_id ASC').all(),
-      treatment_plans: d.prepare('SELECT * FROM treatment_plans ORDER BY id ASC').all(),
-      treatment_steps: d.prepare('SELECT * FROM treatment_steps ORDER BY id ASC').all(),
-      recycle_bin: d.prepare('SELECT * FROM recycle_bin ORDER BY id ASC').all(),
-    }
-    const exportsDir = path.join(app.getPath('userData'), 'exports')
-    fs.mkdirSync(exportsDir, { recursive: true })
-    const outPath = path.join(exportsDir, `dente-export-${nowStamp()}.json`)
-    fs.writeFileSync(outPath, JSON.stringify(payload, null, 2), 'utf-8')
-    return { outPath }
-  },
-  listRecycleBin(limit = 200) {
-    const d = ensureDb()
-    const n = Number(limit)
-    const capped = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 1000) : 200
-    return d
-      .prepare(
-        `SELECT id, source_table, entity_id, deleted_at, restored_at
-         FROM recycle_bin
-         ORDER BY id DESC
-         LIMIT ?`,
-      )
-      .all(capped)
-  },
-  restoreRecycleBinItem(recycleItemId) {
-    const d = ensureDb()
-    const tx = d.transaction((id) => restoreDeletedRow(d, id))
-    createFileBackup('before-recycle-restore')
-    return tx(recycleItemId)
   },
 }
 

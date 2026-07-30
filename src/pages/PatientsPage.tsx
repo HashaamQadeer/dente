@@ -6,6 +6,7 @@ import { useLocation } from 'react-router-dom'
 
 import type { MedicalHistory, MedicalHistoryUpsert, Patient, PatientCreateUpdate, Procedure, ProcedureCreateUpdate } from '../dente-api'
 import { getDenteApi } from '../lib/api'
+import { useAuth } from '../lib/useAuth'
 import { Button, Card, Input, Modal, Select } from '../ui/components'
 
 const patientSchema = z.object({
@@ -66,6 +67,7 @@ function splitCsv(v: string | null | undefined) {
 }
 
 export function PatientsPage() {
+  const { canDelete, promptDeleteDenied } = useAuth()
   const [query, setQuery] = useState('')
   const [rows, setRows] = useState<Patient[]>([])
   const [loading, setLoading] = useState(false)
@@ -339,6 +341,10 @@ export function PatientsPage() {
   }
 
   async function onProcedureDelete(row: Procedure) {
+    if (!canDelete) {
+      promptDeleteDenied()
+      return
+    }
     const ok = confirm(`Delete procedure "${row.procedure_name}"? This cannot be undone.`)
     if (!ok) return
     try {
@@ -371,6 +377,10 @@ export function PatientsPage() {
   }
 
   async function onDelete(patient: Patient) {
+    if (!canDelete) {
+      promptDeleteDenied()
+      return
+    }
     const ok = confirm(`Delete patient "${patient.full_name}" (ID ${patient.id})? This cannot be undone.`)
     if (!ok) return
     try {
@@ -510,16 +520,18 @@ export function PatientsPage() {
                       >
                         Edit
                       </Button>
-                      <Button
-                        variant="danger"
-                        size="sm"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          onDelete(p)
-                        }}
-                      >
-                        Delete
-                      </Button>
+                      {canDelete ? (
+                        <Button
+                          variant="danger"
+                          size="sm"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onDelete(p)
+                          }}
+                        >
+                          Delete
+                        </Button>
+                      ) : null}
                     </div>
                   </td>
                 </tr>
@@ -952,9 +964,11 @@ export function PatientsPage() {
                         <Button variant="secondary" size="sm" onClick={() => setProcEditing(r)}>
                           Edit
                         </Button>
-                        <Button variant="danger" size="sm" onClick={() => onProcedureDelete(r)}>
-                          Delete
-                        </Button>
+                        {canDelete ? (
+                          <Button variant="danger" size="sm" onClick={() => onProcedureDelete(r)}>
+                            Delete
+                          </Button>
+                        ) : null}
                       </div>
                     </td>
                   </tr>
